@@ -1,107 +1,78 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
-import pdfplumber
-import io
-import olefile
+from io import BytesIO
 
-# --- 1. 엑셀 병합 셀 처리 및 AI 친화적 MD 변환 함수 ---
-def process_excel(file_bytes, sheet_name):
-    # openpyxl로 로드하여 병합된 셀의 데이터를 각 셀에 채워넣음 (AI가 맥락을 잃지 않도록)
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-    ws = wb[sheet_name]
+def handle_merged_cells(file, sheet_name):
+    """셀 병합을 해제하고 병합된 값을 모든 셀에 채워넣는 함수"""
+    wb = openpyxl.load_workbook(file, data_only=True)
+    sheet = wb[sheet_name]
     
-    # 병합된 셀 범위 확인 및 값 채우기
-    mcr_list = list(ws.merged_cells.ranges)
-    for mcr in mcr_list:
-        min_col, min_row, max_col, max_row = mcr.bounds
-        top_left_cell_value = ws.cell(row=min_row, column=min_col).value
-        ws.unmerge_cells(str(mcr))
-        for row in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col):
-            for cell in row:
-                cell.value = top_left_cell_value
-
-    # 정제된 데이터를 pandas로 읽어 Markdown 표로 변환
-    data = ws.values
-    cols = next(data)[0:]
+    # 병합된 셀 정보 파악 및 값 복사
+    merged_cells = list(sheet.merged_cells.ranges)
+    for merged_range in merged_cells:
+        # 병합된 영역의 첫 번째 셀 값 가져오기
+        min_col, min_row, max_col, max_row = merged_range.bounds
+        top_left_value = sheet.cell(row=min_row, column=min_col).value
+        
+        # 병합 해제 후 모든 셀에 값 채우기
+        sheet.unmerge_cells(str(merged_range))
+        for row in range(min_row, max_row + 1):
+            for col in range(min_col, max_col + 1):
+                sheet.cell(row=row, column=col).value = top_left_value
+                
+    # 처리된 데이터를 DataFrame으로 변환
+    data = sheet.values
+    cols = next(data)
     df = pd.DataFrame(data, columns=cols)
-    
-    # 빈 값 처리 및 깔끔한 MD 포맷팅
-    df = df.fillna("")
-    return df.to_markdown(index=False)
+    return df
 
-# --- 2. PDF 변환 함수 ---
-def process_pdf(file_bytes):
-    md_text = ""
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            # 텍스트 추출
-            text = page.extract_text()
-            if text:
-                md_text += text + "\n\n"
-            # 표 추출 (AI가 인식할 수 있는 MD 표 형태로 변환)
-            tables = page.extract_tables()
-            for table in tables:
-                df = pd.DataFrame(table[1:], columns=table[0])
-                df = df.fillna("")
-                md_text += df.to_markdown(index=False) + "\n\n"
-    return md_text
+st.set_page_config(page_title="Excel to MD Converter", layout="wide")
+st.title("📊 엑셀 → AI 분석용 MD 변환기")
+st.info("여러 개의 엑셀 파일을 업로드하면 동일한 시트를 찾아 MD 파일로 변환해 드립니다.")
 
-# --- 3. HWP 변환 함수 (기본 텍스트 추출) ---
-def process_hwp(file_bytes):
-    # Linux(Streamlit Cloud) 환경에서 HWP 추출은 제한적이나, 내부 텍스트 스트림을 뽑아내는 기본 로직입니다.
-    f = olefile.OleFileIO(io.BytesIO(file_bytes))
-    dirs = f.listdir()
-    
-    if ["PrvText"] in dirs:
-        text = f.openstream("PrvText").read()
-        return text.decode("utf-16le", errors="ignore")
-    else:
-        return "HWP 파일에서 텍스트를 추출할 수 없습니다. (표 구조가 복잡한 HWP는 PDF 변환 후 업로드 권장)\n"
-
-# --- 웹앱 UI 및 메인 로직 ---
-st.set_page_config(page_title="AI 분석용 다중 파일 MD 변환기", layout="wide")
-st.title("📄 AI 분석용 문서 변환기 (Excel, PDF, HWP ➡️ MD)")
-
-uploaded_files = st.file_uploader("변환할 파일들을 모두 올려주세요.", type=['xlsx', 'pdf', 'hwp'], accept_multiple_files=True)
+# 1. 파일 업로드
+uploaded_files = st.file_uploader("엑셀 파일들을 선택하세요 (여러 개 가능)", type=['xlsx'], accept_multiple_files=True)
 
 if uploaded_files:
-    # 엑셀 파일이 있는지 확인하고 첫 번째 엑셀 파일의 시트 목록을 가져옴
-    excel_files = [f for f in uploaded_files if f.name.endswith('.xlsx')]
-    selected_sheet = None
+    # 첫 번째 파일에서 시트 목록 가져오기
+    first_file = uploaded_files[0]
+    temp_wb = openpyxl.load_workbook(first_file)
+    sheet_names = temp_wb.sheetnames
     
-    if excel_files:
-        st.subheader("📊 엑셀 시트 선택 (모든 엑셀 파일에 동일하게 적용됩니다)")
-        # 첫 번째 엑셀 파일의 시트명 추출
-        wb = openpyxl.load_workbook(io.BytesIO(excel_files[0].getvalue()), read_only=True)
-        sheet_names = wb.sheetnames
-        selected_sheet = st.selectbox("변환할 시트를 선택하세요:", sheet_names)
-
-    if st.button("Markdown으로 변환 시작"):
-        for file in uploaded_files:
-            file_bytes = file.getvalue()
-            filename = file.name
-            md_result = f"## 📁 {filename}\n\n"
-            
+    # 2. 시트 선택 (모든 파일에 공통 적용)
+    selected_sheet = st.selectbox("변환할 시트를 선택하세요", sheet_names)
+    
+    if st.button("변환 시작"):
+        for uploaded_file in uploaded_files:
             try:
-                if filename.endswith('.xlsx'):
-                    # 선택된 시트만 처리
-                    md_result += process_excel(file_bytes, selected_sheet)
-                elif filename.endswith('.pdf'):
-                    md_result += process_pdf(file_bytes)
-                elif filename.endswith('.hwp'):
-                    md_result += process_hwp(file_bytes)
+                st.write(f"📄 {uploaded_file.name} 처리 중...")
                 
-                # 결과 출력 및 다운로드 버튼 제공
-                st.markdown(f"### 성공: {filename}")
-                with st.expander(f"{filename} 변환 결과 미리보기"):
-                    st.text(md_result[:500] + "...\n(미리보기 생략)") # 너무 길면 화면이 꽉 차므로 일부만 표시
+                # 파일 객체를 BytesIO로 다시 읽기 (Openpyxl 사용을 위해)
+                file_content = BytesIO(uploaded_file.getvalue())
                 
+                # 셀 병합 처리하여 DataFrame 생성
+                df = handle_merged_cells(file_content, selected_sheet)
+                
+                # 결측치 처리 (AI 분석 시 깨끗한 데이터를 위해)
+                df = df.fillna("")
+                
+                # 3. MD 변환 및 미리보기
+                md_output = df.to_markdown(index=False)
+                
+                # 파일명 생성
+                md_filename = uploaded_file.name.replace(".xlsx", f"_{selected_sheet}.md")
+                
+                # 다운로드 버튼 생성
                 st.download_button(
-                    label=f"⬇️ {filename}.md 다운로드",
-                    data=md_result,
-                    file_name=f"{filename}.md",
+                    label=f"📥 {md_filename} 다운로드",
+                    data=md_output,
+                    file_name=md_filename,
                     mime="text/markdown"
                 )
+                
+                with st.expander(f"{uploaded_file.name} 미리보기"):
+                    st.code(md_output, language='markdown')
+                    
             except Exception as e:
-                st.error(f"{filename} 처리 중 오류 발생: {e}")
+                st.error(f"{uploaded_file.name} 처리 중 오류 발생: {e}")
